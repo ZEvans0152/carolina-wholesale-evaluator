@@ -71,11 +71,24 @@ def decode_vin(vin: str) -> dict:
         return {}
 
 # --- Prediction helper ---
-@st.cache_data(show_spinner=False)
 def predict_value(_pipeline, features):
-    cols = ['Year','Make','Model','Series','Engine Code','Grade','Mileage',
-            'Drivable','Auction Region','Color','Roof','Interior','sale_month','age']
+    # define the exact columns and their types
+    cols = [
+        'Year', 'Make', 'Model', 'Series', 'Engine Code',
+        'Grade', 'Mileage', 'Drivable', 'Auction Region',
+        'Color', 'Roof', 'Interior', 'sale_month', 'age'
+    ]
     rec = pd.DataFrame([features], columns=cols)
+
+    # cast numeric columns to float
+    for num in ['Year', 'Grade', 'Mileage', 'sale_month', 'age']:
+        rec[num] = rec[num].astype(float)
+
+    # cast categorical columns to string
+    for cat in ['Make','Model','Series','Engine Code','Drivable',
+                'Auction Region','Color','Roof','Interior']:
+        rec[cat] = rec[cat].astype(str)
+
     logp = _pipeline.predict(rec)[0]
     return float(np.exp(logp))
 
