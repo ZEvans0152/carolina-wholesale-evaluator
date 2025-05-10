@@ -4,148 +4,206 @@ import numpy as np
 import pickle
 import requests
 import altair as alt
+import difflib
 
-# 1) Page config must be first Streamlit call
+# --- Page config ---
 st.set_page_config(
     page_title="Carolina Auto Auction Wholesale Evaluator",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# 2) Load data & detect date column
+# --- Caching data & model ---
 @st.cache_data
 def load_data():
-    df = pd.read_excel("226842_196b62e8465_127512.xlsx")
-    # ensure consistent dtypes
-    for c in ['Make','Model','Series','Engine Code','Auction Region','Color','Roof','Interior']:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-    # find any column with 'date' in its name
-    date_col = next((col for col in df.columns if 'date' in col.lower()), None)
-    if date_col:
-        df[date_col] = pd.to_datetime(df[date_col])
-    return df, date_col
+    df = pd.read_excel(
+        "226842_196b62e8465_127512.xlsx",
+        parse_dates=["Sold Date"], engine="openpyxl"
+    )
+    df['sale_month'] = df['Sold Date'].dt.month
+    df['age'] = pd.Timestamp.now().year - df['Year']
+    for col in ['Make','Model','Series','Engine Code','Roof','Interior']:
+        df[col] = df[col].astype(str)
+    return df
 
-df_data, date_col = load_data()
-
-# 3) Load your trained pipeline if still needed (unused below)
 @st.cache_resource
-def load_pipeline():
+def load_model():
     with open("model_pipeline.pkl", "rb") as f:
         return pickle.load(f)
 
-pipeline = load_pipeline()
+# Load once
+df = load_data()
+pipeline = load_model()
 
-# 4) VIN decoder via NHTSA API
-@st.cache_data
-def decode_vin(vin):
-    url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}?format=json"
-    r = requests.get(url).json().get("Results", [{}])[0]
+# --- Precompute lookups ---
+makes = sorted(df['Make'].unique())
+models_by_make = {mk: sorted(df[df['Make']==mk]['Model'].unique()) for mk in makes}
+series_by_model = {
+    (mk,mo): sorted(df[(df['Make']==mk)&(df['Model']==mo)]['Series'].unique())
+    for mk in makes for mo in models_by_make[mk]
+}
+engines_by_series = {
+    (mk,mo,ser): sorted(
+        df[(df['Make']==mk)&(df['Model']==mo)&(df['Series']==ser)]['Engine Code'].unique()
+    )
+    for (mk,mo), sels in series_by_model.items() for ser in sels
+}
+engines_by_model = {
+    (mk,mo): sorted(df[(df['Make']==mk)&(df['Model']==mo)]['Engine Code'].unique())
+    for mk in makes for mo in models_by_make[mk]
+}
+roof_by_series = {
+    (mk,mo,ser): sorted(
+        df[(df['Make']==mk)&(df['Model']==mo)&(df['Series']==ser)]['Roof'].unique()
+    )
+    for (mk,mo), sels in series_by_model.items() for ser in sels
+}
+roof_by_model = {
+    (mk,mo): sorted(df[(df['Make']==mk)&(df['Model']==mo)]['Roof'].unique())
+    for mk in makes for mo in models_by_make[mk]
+}
+interior_by_series = {
+    (mk,mo,ser): sorted(
+        df[(df['Make']==mk)&(df['Model']==mo)&(df['Series']==ser)]['Interior'].unique()
+    )
+    for (mk,mo), sels in series_by_model.items() for ser in sels
+}
+interior_by_model = {
+    (mk,mo): sorted(df[(df['Make']==mk)&(df['Model']==mo)]['Interior'].unique())
+    for mk in makes for mo in models_by_make[mk]
+}
+regions = sorted(df['Auction Region'].dropna().unique())
+colors = sorted(df['Color'].dropna().unique())
+
+# --- VIN decode ---
+def decode_vin(vin: str) -> dict:
+    resp = requests.get(
+        f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}?format=json"
+    ).json()
+    r = resp['Results'][0]
     return {
-        "Year": int(r.get("ModelYear") or 0),
-        "Make": r.get("Make", "").upper(),
-        "Model": r.get("Model", "").upper(),
-        "Series": r.get("Trim", "").upper()
+        'Year': int(r.get('ModelYear') or 0),
+        'Make': r.get('Make','').upper(),
+        'Model': r.get('Model','').upper(),
+        'Series': r.get('Trim','').upper(),
+        'Disp': r.get('Engine Displacement (L)') or '',
+        'EngMod': r.get('Engine Model') or ''
     }
 
-# 5) Build sidebar dropdown mappings
-@st.cache_data
-def build_mappings(df):
-    makes = sorted(df["Make"].unique())
-    models_map = {m: sorted(df[df["Make"]==m]["Model"].unique()) for m in makes}
-    series_map = {(m,md): sorted(df[(df["Make"]==m)&(df["Model"]==md)]["Series"].unique())
-                  for m in makes for md in models_map[m]}
-    engine_map = {(m,md,ser): sorted(df[(df["Make"]==m)&(df["Model"]==md)&(df["Series"]==ser)]["Engine Code"].unique())
-                  for m in makes for md in models_map[m] for ser in series_map[(m,md)]}
-    roof_map = {(m,md,ser): sorted(df[(df["Make"]==m)&(df["Model"]==md)&(df["Series"]==ser)]["Roof"].unique())
-                for m in makes for md in models_map[m] for ser in series_map[(m,md)]}
-    interior_map = {(m,md,ser): sorted(df[(df["Make"]==m)&(df["Model"]==md)&(df["Series"]==ser)]["Interior"].unique())
-                    for m in makes for md in models_map[m] for ser in series_map[(m,md)]}
-    regions = sorted(df["Auction Region"].unique())
-    colors = sorted(df["Color"].unique())
-    return makes, models_map, series_map, engine_map, roof_map, interior_map, regions, colors
-
-makes, models_map, series_map, engine_map, roof_map, interior_map, regions, colors = build_mappings(df_data)
-
-# 6) Sidebar inputs
+# --- Sidebar ---
 st.sidebar.header("Input Vehicle Specs")
-
-vin = st.sidebar.text_input("Enter VIN (optional)").strip()
+vin = st.sidebar.text_input("Enter VIN (optional)")
+use_vin = False
 decoded = {}
+
 if vin:
-    decoded = decode_vin(vin)
-    if decoded["Year"] > 0:
-        st.sidebar.subheader("Decoded VIN Vehicle")
-        st.sidebar.write(f"**Year:** {decoded['Year']}")
-        st.sidebar.write(f"**Make:** {decoded['Make']}")
-        st.sidebar.write(f"**Model:** {decoded['Model']}")
-        st.sidebar.write(f"**Trim:** {decoded['Series']}")
-    else:
-        st.sidebar.error("VIN could not be decoded. Please select manually.")
-        vin = ""
+    try:
+        decoded = decode_vin(vin)
+        if decoded['Year'] > 0:
+            use_vin = True
+            st.sidebar.subheader("Decoded VIN Vehicle")
+            for k in ['Year','Make','Model','Series']:
+                st.sidebar.write(f"{k}: {decoded[k]}")
+    except:
+        st.sidebar.error("VIN decode failed — please select manually.")
 
-if not vin:
-    model_year = st.sidebar.number_input("Model Year", 1990, 2025, 2021)
-    make       = st.sidebar.selectbox("Make", makes)
-    model      = st.sidebar.selectbox("Model", models_map[make])
-    series     = st.sidebar.selectbox("Series/Trim", series_map[(make, model)])
+if not use_vin:
+    decoded['Year'] = st.sidebar.number_input(
+        "Model Year", 1980, pd.Timestamp.now().year, pd.Timestamp.now().year
+    )
+    decoded['Make'] = st.sidebar.selectbox("Make", makes)
+    decoded['Model'] = st.sidebar.selectbox(
+        "Model", models_by_make[decoded['Make']]
+    )
+    decoded['Series'] = st.sidebar.selectbox(
+        "Series/Trim", series_by_model[(decoded['Make'],decoded['Model'])]
+    )
+
+# Engine selection with fallback
+disp = decoded.get('Disp','')
+eng_list = engines_by_series.get(
+    (decoded['Make'],decoded['Model'],decoded['Series']), []
+) or engines_by_model.get((decoded['Make'],decoded['Model']), [])
+suggest = []
+if use_vin and disp:
+    suggest = difflib.get_close_matches(disp, eng_list, n=1)
+if use_vin and not suggest and decoded.get('EngMod'):
+    suggest = difflib.get_close_matches(decoded['EngMod'], eng_list, n=1)
+if suggest:
+    decoded['Engine Code'] = suggest[0]
 else:
-    model_year = decoded["Year"]
-    make       = decoded["Make"]
-    model      = decoded["Model"]
-    series     = decoded["Series"]
+    decoded['Engine Code'] = st.sidebar.selectbox("Engine Type", eng_list)
 
-# always-visible inputs
-engine   = st.sidebar.selectbox("Engine Type", engine_map[(make, model, series)])
-grade    = st.sidebar.slider("Grade", 1.0, 5.0, 3.0, step=0.1)
-mileage  = st.sidebar.number_input("Mileage", 0, 300000, 50000)
-drivable = st.sidebar.selectbox("Drivable", ["Yes","No"])
-region   = st.sidebar.selectbox("Auction Region", regions)
-color    = st.sidebar.selectbox("Exterior Color", colors)
-roof     = st.sidebar.selectbox("Roof Type", roof_map[(make, model, series)])
-interior = st.sidebar.selectbox("Interior Type", interior_map[(make, model, series)])
+# Common inputs
+decoded['Grade'] = st.sidebar.slider("Grade", 1.0, 5.0, 3.0, 0.1)
+decoded['Mileage'] = st.sidebar.number_input("Mileage", 0, 300000, 50000)
+decoded['Drivable'] = st.sidebar.selectbox("Drivable", ["Yes","No"])
+decoded['Auction Region'] = st.sidebar.selectbox("Auction Region", regions)
+decoded['Color'] = st.sidebar.selectbox("Exterior Color", colors)
 
-# 7) Main area: title & tabs
+# Roof selection fallback
+r_list = roof_by_series.get(
+    (decoded['Make'],decoded['Model'],decoded['Series']), []
+) or roof_by_model.get((decoded['Make'],decoded['Model']), [])
+decoded['Roof'] = st.sidebar.selectbox("Roof Type", r_list)
+
+# Interior selection fallback
+i_list = interior_by_series.get(
+    (decoded['Make'],decoded['Model'],decoded['Series']), []
+) or interior_by_model.get((decoded['Make'],decoded['Model']), [])
+decoded['Interior'] = st.sidebar.selectbox("Interior Type", i_list)
+
+# Derive sale_month & age
+dnow = pd.Timestamp.now()
+decoded['sale_month'] = dnow.month
+decoded['age'] = dnow.year - decoded['Year']
+
+# --- Main ---
 st.title("🚗 Carolina Auto Auction Wholesale Evaluator")
-tab1, tab2 = st.tabs(["Estimate", "History & Recent Sales"])
+if st.button("Estimate Wholesale Value"):
+    rec = pd.DataFrame([decoded])
+    logp = pipeline.predict(rec)[0]
+    val = np.exp(logp)
+    st.success(f"💰 Estimated Wholesale Value: ${val:,.2f}")
 
-# 8) Helper to filter last-60-day records
-def get_recent_df():
-    cutoff = pd.to_datetime("today") - pd.Timedelta(days=60)
-    return df_data[
-        (df_data["Make"]==make) &
-        (df_data["Model"]==model) &
-        (df_data["Series"]==series) &
-        (df_data[date_col] >= cutoff)
+# Tabs
+tab1, tab2 = st.tabs(["Estimate","History & Recent Sales"])
+
+@st.cache_data
+def get_hist_df(make, model, series, cutoff):
+    return df.loc[
+        (df['Make']==make) & (df['Model']==model) &
+        (df['Series']==series) & (df['Sold Date']>=cutoff)
     ]
 
-with tab1:
-    if st.button("Estimate Wholesale Value"):
-        dfh = get_recent_df()
-        if not dfh.empty:
-            median_price = dfh["Sale Price"].median()
-            st.metric("Estimated Value", f"${median_price:,.2f}")
-            recent = dfh.sort_values(date_col, ascending=False).head(5)
-            st.write("### Last 5 Transactions")
-            st.dataframe(
-                recent[[date_col, "Make", "Model", "Series", "Sale Price"]]
-                .rename(columns={date_col: "Sale Date"}),
-                use_container_width=True
-            )
-        else:
-            st.warning("No historical data for this configuration in the last 60 days.")
+@st.cache_data
+def get_recent_df(make, model, series, low, high, cutoff):
+    return df.loc[
+        (df['Make']==make) & (df['Model']==model) &
+        (df['Series']==series) & (df['Year']>=low) &
+        (df['Year']<=high) & (df['Sold Date']>=cutoff)
+    ]
 
 with tab2:
-    dfh = get_recent_df()
-    if not dfh.empty:
-        df_plot = (
-            dfh.set_index(date_col)["Sale Price"]
-            .resample("D").median()
-            .reset_index()
-        )
-        chart = alt.Chart(df_plot).mark_line(color="#6a0dad").encode(
-            x=alt.X(f"{date_col}:T", title="Date"),
-            y=alt.Y("Sale Price:Q", title="Median Daily Price")
-        ).properties(height=300)
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=120)
+    hist = get_hist_df(decoded['Make'], decoded['Model'], decoded['Series'], cutoff)
+    st.subheader("Price History (Last 120 Days)")
+    if not hist.empty:
+        chart = alt.Chart(hist).mark_line(point=True).encode(
+            x='Sold Date:T', y='Sale Price:Q'
+        ).properties(width=600, height=300)
         st.altair_chart(chart, use_container_width=True)
     else:
-        st.write("No sales to chart in the last 60 days.")
+        st.info("No recent sales in last 120 days.")
+
+    st.subheader("Last 10 Transactions (±2 years)")
+    low, high = decoded['Year']-2, decoded['Year']+2
+    recent = get_recent_df(decoded['Make'], decoded['Model'], decoded['Series'], low, high, cutoff)
+    recent = recent.sort_values('Sold Date', ascending=False).head(10)
+    if not recent.empty:
+        st.dataframe(
+            recent[['Sold Date','Year','Make','Model','Series','Grade','Mileage','Sale Price']],
+            hide_index=True, use_container_width=True
+        )
+    else:
+        st.info("No historical transactions found.")
