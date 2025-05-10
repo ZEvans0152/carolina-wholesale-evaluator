@@ -21,12 +21,14 @@ if "made_estimate" not in st.session_state:
 @st.cache_data(show_spinner=False)
 def load_data():
     df = pd.read_excel(
-        "226842_196b62e8465_127512.xlsx", parse_dates=["Sold Date"], engine="openpyxl"
+        "226842_196b62e8465_127512.xlsx",
+        parse_dates=["Sold Date"], engine="openpyxl"
     )
     df["sale_month"] = df["Sold Date"].dt.month
     df["age"] = pd.Timestamp.now().year - df["Year"]
+    # ensure no nulls sneak into our categorical columns
     for c in ["Make","Model","Series","Engine Code","Roof","Interior"]:
-        df[c] = df[c].astype(str)
+        df[c] = df[c].fillna("").astype(str)
     return df
 
 @st.cache_resource(show_spinner=False)
@@ -48,8 +50,18 @@ def build_dropdowns(df):
         )
         for (mk,mo), sels in series.items() for ser in sels
     }
-    roofs = {k: sorted(v) for k,v in engines.items()}  # same grouping keys
-    interiors = {k: sorted(v) for k,v in engines.items()}
+    roofs = {
+        (mk,mo,ser): sorted(
+            df[(df["Make"]==mk)&(df["Model"]==mo)&(df["Series"]==ser)]["Roof"].unique()
+        )
+        for (mk,mo), sels in series.items() for ser in sels
+    }
+    interiors = {
+        (mk,mo,ser): sorted(
+            df[(df["Make"]==mk)&(df["Model"]==mo)&(df["Series"]==ser)]["Interior"].unique()
+        )
+        for (mk,mo), sels in series.items() for ser in sels
+    }
     regions = sorted(df["Auction Region"].dropna().unique())
     colors = sorted(df["Color"].dropna().unique())
     return makes, models, series, engines, roofs, interiors, regions, colors
@@ -80,7 +92,7 @@ def predict_value(_pipeline, feat:dict):
         "Drivable","Auction Region","Color","Roof","Interior","sale_month","age"
     ]
     rec = pd.DataFrame([{k:feat[k] for k in cols}], columns=cols)
-    # ensure categoricals are str
+    # cast categoricals to str (defensive)
     for c in ["Make","Model","Series","Engine Code","Drivable","Auction Region","Color","Roof","Interior"]:
         rec[c] = rec[c].astype(str)
     lp = _pipeline.predict(rec)[0]
@@ -89,7 +101,7 @@ def predict_value(_pipeline, feat:dict):
 # --- Load once ---
 df = load_data()
 pipeline = load_model()
-_makes,_models,_series,_engines,_roofs,_ints,_regions,_colors = build_dropdowns(df)
+_makes, _models, _series, _engines, _roofs, _ints, _regions, _colors = build_dropdowns(df)
 
 # --- Sidebar inputs ---
 st.sidebar.header("Input Vehicle Specs")
@@ -135,7 +147,6 @@ if suggest:
 else:
     engine = st.sidebar.selectbox("Engine Type",elist)
 
-# rest of sidebar
 roof = st.sidebar.selectbox("Roof Type",_roofs.get((make,model,series),[]))
 interior = st.sidebar.selectbox("Interior Type",_ints.get((make,model,series),[]))
 grade = st.sidebar.slider("Grade",1.0,5.0,3.0)
@@ -144,7 +155,7 @@ drivable = st.sidebar.selectbox("Drivable",["Yes","No"])
 region = st.sidebar.selectbox("Auction Region",_regions)
 color = st.sidebar.selectbox("Exterior Color",_colors)
 
-# derive extra
+# derive
 sale_month = pd.Timestamp.now().month
 age = pd.Timestamp.now().year - year
 
@@ -181,14 +192,14 @@ if st.session_state["made_estimate"]:
     if not subset.empty:
         chart = (
             alt.Chart(subset).mark_line(point=True)
-            .encode(x="Sold Date:T",y="Sale Price:Q")
-            .properties(width=700,height=300)
+               .encode(x="Sold Date:T",y="Sale Price:Q")
+               .properties(width=700,height=300)
         )
         st.altair_chart(chart,use_container_width=True)
         st.subheader("Last 10 Transactions")
         last10 = subset.sort_values("Sold Date",ascending=False).head(10)
         st.dataframe(
-            last10[["Sold Date","Year","Make","Model","Series","Grade","Mileage","Sale Price"]],
+            last10[["Sold Date","Year","Make","Model","Series","Engine Code","Drivable","Roof","Interior","Grade","Mileage","Sale Price"]],
             hide_index=True,use_container_width=True
         )
     else:
